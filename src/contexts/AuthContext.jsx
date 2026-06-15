@@ -1,7 +1,7 @@
-import { createContext, useContext, useState, useEffect } from 'react';
-import { auth, db } from '../firebaseConfig';
-import { onAuthStateChanged, signInWithEmailAndPassword, signOut, createUserWithEmailAndPassword } from 'firebase/auth';
-import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { createContext, useContext, useEffect, useState } from 'react';
+import { useAuth as useClerkAuth, useClerk, useUser } from '@clerk/clerk-react';
+import { db } from '../firebaseConfig';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 
 const AuthContext = createContext();
 
@@ -11,65 +11,97 @@ export function useAuth() {
 
 export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(null);
-  const [userRole, setUserRole] = useState(null); // 'admin' or 'participant'
-  const [userProfile, setUserProfile] = useState(null); // { name, email, role }
+  const [userRole, setUserRole] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
   const [loading, setLoading] = useState(true);
+  const { isLoaded: clerkAuthLoaded, isSignedIn } = useClerkAuth();
+  const { isLoaded: clerkUserLoaded, user } = useUser();
+  const { signOut } = useClerk();
 
-  async function fetchAndSetUserProfile(user) {
-    if (!user) {
+  const mapClerkUser = (clerkUser) => {
+    if (!clerkUser) return null;
+
+    const email = clerkUser.primaryEmailAddress?.emailAddress || '';
+    const displayName = clerkUser.fullName || clerkUser.firstName || email.split('@')[0] || 'User';
+
+    return {
+      uid: clerkUser.id,
+      email,
+      displayName,
+      firstName: clerkUser.firstName || '',
+      lastName: clerkUser.lastName || '',
+      imageUrl: clerkUser.imageUrl || '',
+    };
+  };
+
+  async function syncUserProfile(clerkUser) {
+    if (!clerkUser) {
+      setCurrentUser(null);
       setUserRole(null);
       setUserProfile(null);
       return;
     }
 
+    const appUser = mapClerkUser(clerkUser);
+    setCurrentUser(appUser);
+
     try {
-      const userDoc = await getDoc(doc(db, 'users', user.uid));
+      const userDoc = await getDoc(doc(db, 'users', appUser.uid));
       if (userDoc.exists()) {
         const data = userDoc.data();
-        setUserRole(data.role);
+        setUserRole(data.role || null);
         setUserProfile(data);
       } else {
-        setUserRole('participant');
-        setUserProfile({ name: user.email?.split('@')[0], email: user.email, role: 'participant' });
+        setUserRole(null);
+        setUserProfile(null);
       }
     } catch (error) {
-      console.error("Error fetching user role:", error);
-      setUserRole('participant');
-      setUserProfile({ name: user.email?.split('@')[0], email: user.email, role: 'participant' });
+      console.error('Error fetching user role:', error);
+      setUserRole(null);
+      setUserProfile(null);
     }
   }
 
-  async function login(email, password) {
-    return signInWithEmailAndPassword(auth, email, password);
-  }
+  async function completeProfile({ name, role = 'participant', competitionCode = '' }) {
+    if (!currentUser) {
+      throw new Error('not-authenticated');
+    }
 
-  async function signup(email, password, name, role = 'participant', competitionCode = '') {
-    if (role === 'participant') {
-      if (!competitionCode) {
+    const trimmedName = name?.trim();
+    const normalizedRole = role === 'admin' ? 'admin' : 'participant';
+    const trimmedCompetitionCode = competitionCode?.trim();
+
+    if (!trimmedName) {
+      throw new Error('name-required');
+    }
+
+    if (normalizedRole === 'participant') {
+      if (!trimmedCompetitionCode) {
         throw new Error('competition-code-required');
       }
 
-      const competitionDoc = await getDoc(doc(db, 'competitions', competitionCode));
+      const competitionDoc = await getDoc(doc(db, 'competitions', trimmedCompetitionCode));
       if (!competitionDoc.exists()) {
         throw new Error('invalid-competition-code');
       }
     }
 
-    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
     const profileData = {
-      name: name || email.split('@')[0],
-      role: role,
-      email: email,
+      name: trimmedName,
+      role: normalizedRole,
+      email: currentUser.email,
       createdAt: Date.now(),
-      ...(competitionCode ? { competitionCode } : {})
+      ...(trimmedCompetitionCode ? { competitionCode: trimmedCompetitionCode } : {})
     };
-    // Use setDoc so the document is created from scratch (no pre-existing doc needed)
-    await setDoc(doc(db, 'users', userCredential.user.uid), profileData);
-    return userCredential;
+
+    await setDoc(doc(db, 'users', currentUser.uid), profileData, { merge: true });
+    setUserRole(normalizedRole);
+    setUserProfile(profileData);
+    return profileData;
   }
 
   async function joinCompetitionCode(competitionCode) {
-    if (!auth.currentUser) {
+    if (!currentUser) {
       throw new Error('not-authenticated');
     }
 
@@ -83,36 +115,57 @@ export function AuthProvider({ children }) {
       throw new Error('invalid-competition-code');
     }
 
-    await updateDoc(doc(db, 'users', auth.currentUser.uid), {
-      competitionCode: normalizedCode
-    });
+    await setDoc(doc(db, 'users', currentUser.uid), {
+      competitionCode: normalizedCode,
+    }, { merge: true });
 
-    await fetchAndSetUserProfile(auth.currentUser);
+    await syncUserProfile(user);
   }
 
   function logout() {
-    return signOut(auth);
+    return signOut();
   }
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setCurrentUser(user);
-      await fetchAndSetUserProfile(user);
-      setLoading(false);
-    });
+    if (!clerkAuthLoaded || !clerkUserLoaded) {
+      return undefined;
+    }
 
-    return unsubscribe;
-  }, []);
+    let cancelled = false;
+
+    const run = async () => {
+      if (!isSignedIn || !user) {
+        if (!cancelled) {
+          setCurrentUser(null);
+          setUserRole(null);
+          setUserProfile(null);
+          setLoading(false);
+        }
+        return;
+      }
+
+      await syncUserProfile(user);
+
+      if (!cancelled) {
+        setLoading(false);
+      }
+    };
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clerkAuthLoaded, clerkUserLoaded, isSignedIn, user?.id]);
 
   const value = {
     currentUser,
     userRole,
     userProfile,
-    login,
-    signup,
+    completeProfile,
     joinCompetitionCode,
     logout,
-    refreshUserProfile: () => fetchAndSetUserProfile(auth.currentUser)
+    refreshUserProfile: () => syncUserProfile(user),
   };
 
   return (
